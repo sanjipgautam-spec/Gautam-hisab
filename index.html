@@ -390,7 +390,12 @@ function render() {
 
 // ---------- Party detail panel ----------
 function openParty(id) { activePartyId = id; render(); }
-function closeParty() { activePartyId = null; render(); }
+function closeParty() {
+  activePartyId = null;
+  const existing = document.getElementById('party-overlay');
+  if (existing) existing.remove();
+  render();
+}
 
 function renderPartyPanel() {
   const party = data.parties.find(p => p.id === activePartyId);
