@@ -5,9 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Hisab — Family Ledger</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://www.gstatic.com">
+<link rel="preconnect" href="https://firestore.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js" defer></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js" defer></script>
 <style>
   :root {
     --paper: #ECE4CD;
@@ -50,6 +53,7 @@
   .cover .status { font-size: 11px; margin-top: 2px; }
   .status.ok { color: #B9D6BB; }
   .status.err { color: #E4B3A8; }
+  .status.cache { color: #D8C9A3; }
 
   .summary {
     display: grid; grid-template-columns: repeat(4, 1fr);
@@ -171,9 +175,11 @@ const firebaseConfig = {
 
 const DOC_PATH = { collection: 'hisab-family', doc: 'ledger' };
 const USER_KEY = 'hisab-current-user'; // stored per-device only, not shared
+const CACHE_KEY = 'hisab-data-cache'; // last-known ledger, stored per-device for instant reloads
 
 let data = { parties: [], transactions: [], entries: [] };
 let loaded = false;
+let usingCache = false;
 let db = null;
 let docRef = null;
 let currentUser = localStorage.getItem(USER_KEY) || '';
@@ -213,11 +219,41 @@ function showSetupScreen() {
   document.getElementById('sync-status').className = 'status err';
 }
 
+// ---------- Local cache (makes refreshes instant) ----------
+function loadFromCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return;
+    const cached = JSON.parse(raw);
+    if (cached && Array.isArray(cached.parties)) {
+      data = cached;
+      loaded = true;
+      usingCache = true;
+      render();
+      const el = document.getElementById('sync-status');
+      el.textContent = 'showing saved copy — syncing…';
+      el.className = 'status cache';
+    }
+  } catch (e) {
+    console.warn('Could not read local cache:', e);
+  }
+}
+
+function saveToCache() {
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify(data)); }
+  catch (e) { console.warn('Could not write local cache:', e); }
+}
+
 // ---------- Firebase / sync ----------
 function initFirebase() {
   try {
     firebase.initializeApp(firebaseConfig);
     db = firebase.firestore();
+    // Lets the app read from a local on-device store first on future loads,
+    // and keeps working (read-only) if the connection is briefly unavailable.
+    db.enablePersistence().catch((err) => {
+      console.warn('Offline persistence not enabled:', err.code);
+    });
     docRef = db.collection(DOC_PATH.collection).doc(DOC_PATH.doc);
     docRef.onSnapshot(
       (snap) => {
@@ -228,6 +264,8 @@ function initFirebase() {
           data = { parties: [], transactions: [], entries: [] };
         }
         loaded = true;
+        usingCache = false;
+        saveToCache();
         setStatus(true);
         render();
       },
@@ -252,6 +290,7 @@ async function saveData() {
   if (!docRef) return;
   try {
     await docRef.set(data);
+    saveToCache();
     setStatus(true);
   } catch (e) {
     console.error('Could not save:', e);
@@ -557,8 +596,13 @@ document.getElementById('current-user-label').textContent = currentUser || '—'
 if (configIsPlaceholder()) {
   showSetupScreen();
 } else {
+  // Paint the last-known ledger from local storage immediately, before
+  // Firebase's scripts (loaded with `defer`) have even finished downloading.
+  loadFromCache();
   ensureUser(() => {});
-  initFirebase();
+  // Firebase's compat scripts are `defer`red, so wait for the page to finish
+  // parsing before touching the `firebase` global.
+  window.addEventListener('DOMContentLoaded', initFirebase);
 }
 </script>
 </body>
