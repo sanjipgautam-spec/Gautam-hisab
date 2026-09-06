@@ -11,6 +11,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js" defer></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js" defer></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js" defer></script>
 <style>
   :root {
     --paper: #ECE4CD;
@@ -77,6 +78,8 @@
   .btn.secondary { background: transparent; color: var(--ink); border: 1px solid var(--rule-strong); }
   .btn.secondary:hover { border-color: var(--ink); background: var(--paper-dark); }
   .btn:disabled { opacity: 0.5; cursor: default; }
+  .btn.wide { width: 100%; padding: 11px; font-size: 14px; }
+  .link-btn { background: none; border: none; color: var(--maroon); text-decoration: underline; cursor: pointer; font-size: 13px; padding: 0; font-family: 'IBM Plex Sans', sans-serif; }
 
   section.block { margin-bottom: 32px; }
 
@@ -108,11 +111,13 @@
   .field label { display: block; font-size: 12px; color: var(--ink-soft); margin-bottom: 4px; }
   .field input, .field select { width: 100%; padding: 9px 10px; border: 1px solid var(--rule-strong); background: #FBF8EF; font-family: 'IBM Plex Sans', sans-serif; font-size: 14px; color: var(--ink); }
   .field input:focus, .field select:focus { outline: 2px solid var(--maroon); outline-offset: 1px; }
+  .field .hint { font-size: 11px; color: var(--ink-soft); margin-top: 4px; }
   .type-toggle { display: flex; gap: 8px; flex-wrap: wrap; }
   .type-toggle button { flex: 1; min-width: 120px; padding: 9px 8px; font-size: 13px; border: 1px solid var(--rule-strong); background: #FBF8EF; color: var(--ink); cursor: pointer; }
   .type-toggle button.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
   .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
-  .error-text { color: var(--red); font-size: 12px; margin-top: 6px; }
+  .error-text { color: var(--red); font-size: 12px; margin-top: 6px; min-height: 14px; }
+  .notice-text { color: var(--green); font-size: 12px; margin-bottom: 14px; }
 
   .panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
   .panel-header h3 { font-family: 'Fraunces', serif; font-size: 22px; margin: 0; }
@@ -134,6 +139,12 @@
   .top-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }
   .footer-note { margin-top: 40px; font-size: 12px; color: var(--ink-soft); border-top: 1px solid var(--rule); padding-top: 14px; }
   .by-tag { color: var(--ink-soft); }
+
+  .auth-wrap { max-width: 400px; margin: 40px auto; padding: 0 20px; }
+  .auth-card { background: var(--paper-dark); border: 1px solid var(--rule-strong); padding: 28px 24px; }
+  .auth-card h2 { font-family: 'Fraunces', serif; font-size: 22px; margin: 0 0 4px; }
+  .auth-card .sub { font-size: 13px; color: var(--ink-soft); margin-bottom: 20px; }
+  .auth-links { display: flex; flex-direction: column; gap: 10px; align-items: center; margin-top: 16px; }
 </style>
 </head>
 <body>
@@ -144,14 +155,16 @@
       <h1>Hisab</h1>
       <div class="tagline">Your family's shared income &amp; expense ledger</div>
     </div>
-    <div class="who">
-      <div>You're logged as <strong id="current-user-label">—</strong><button onclick="switchUser()">switch</button></div>
+    <div class="who" id="who-box" style="display:none;">
+      <div>You're logged as <strong id="current-user-label">—</strong><button onclick="logout()">log out</button></div>
       <div class="status" id="sync-status">connecting…</div>
     </div>
   </div>
 </div>
 
-<div class="app">
+<div id="auth-container"></div>
+
+<div class="app" id="app-container" style="display:none;">
   <div id="content">
     <div class="loading-screen">Opening your ledger…</div>
   </div>
@@ -162,6 +175,8 @@
    1) PASTE YOUR FIREBASE CONFIG BELOW
    Get this from: Firebase console → Project settings → your web app
    Replace the whole object, then save this file and reopen it.
+   Make sure Authentication → Sign-in method → Email/Password is
+   enabled in the Firebase console, or login/register will fail.
    ============================================================ */
 const firebaseConfig = {
   apiKey: "AIzaSyA24r6PUWWmriwwZgZTtsk-WTkVt65sK0U",
@@ -174,19 +189,28 @@ const firebaseConfig = {
 /* ============================================================ */
 
 const DOC_PATH = { collection: 'hisab-family', doc: 'ledger' };
-const USER_KEY = 'hisab-current-user'; // stored per-device only, not shared
 const CACHE_KEY = 'hisab-data-cache'; // last-known ledger, stored per-device for instant reloads
 
 let data = { parties: [], transactions: [], entries: [] };
 let loaded = false;
-let usingCache = false;
 let db = null;
+let auth = null;
 let docRef = null;
-let currentUser = localStorage.getItem(USER_KEY) || '';
+let ledgerUnsub = null;
+let ledgerStarted = false;
+let currentUser = '';
+let userProfile = null;
 let activeModal = null;
 let activePartyId = null;
 let txnTypeChoice = 'purchase';
 let entryTypeChoice = 'expense';
+
+// ---------- Auth state ----------
+let authScreen = 'login'; // login | register | awaitingVerification | forgotEmail | forgotSent | resetPassword
+let authNotice = '';
+let authError = '';
+let resetOobCode = null;
+let resetEmail = '';
 
 const EXPENSE_CATEGORIES = ['Food', 'Transport', 'Utilities', 'Rent', 'Health', 'Shopping', 'Entertainment', 'Other'];
 const INCOME_CATEGORIES = ['Salary', 'Freelance', 'Gift', 'Interest', 'Other'];
@@ -196,6 +220,7 @@ function todayStr() { return new Date().toISOString().slice(0, 10); }
 function fmt(n) { return 'Rs ' + (Number(n) || 0).toLocaleString('en-IN'); }
 function formatDate(d) { return new Date(d + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }); }
 function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+function returnUrl() { return window.location.origin + window.location.pathname; }
 
 // ---------- Setup check ----------
 function configIsPlaceholder() {
@@ -203,7 +228,7 @@ function configIsPlaceholder() {
 }
 
 function showSetupScreen() {
-  document.getElementById('content').innerHTML = `
+  document.getElementById('auth-container').innerHTML = `
     <div class="setup-screen">
       <h2>One more step</h2>
       <p>This app needs to be connected to your family's shared Firebase database before it can save or sync anything.</p>
@@ -215,8 +240,265 @@ function showSetupScreen() {
       </ol>
       <p>If you're not sure how to edit the file, just paste your Firebase config back in the chat with Claude and ask for the finished file.</p>
     </div>`;
-  document.getElementById('sync-status').textContent = 'not connected';
-  document.getElementById('sync-status').className = 'status err';
+}
+
+// ---------- Friendly error messages ----------
+function friendlyAuthError(code) {
+  const map = {
+    'auth/email-already-in-use': 'An account with that email already exists.',
+    'auth/invalid-email': 'That email address doesn\'t look right.',
+    'auth/weak-password': 'Password should be at least 6 characters.',
+    'auth/user-not-found': 'No account found with those details.',
+    'auth/wrong-password': 'Incorrect username or password.',
+    'auth/invalid-credential': 'Incorrect username or password.',
+    'auth/too-many-requests': 'Too many attempts — please wait a bit and try again.',
+    'auth/invalid-action-code': 'That link is invalid or has already been used.',
+    'auth/expired-action-code': 'That link has expired — please request a new one.'
+  };
+  return map[code] || 'Something went wrong. Please try again.';
+}
+
+// ---------- Auth screen rendering ----------
+function showAuthUI() {
+  document.getElementById('auth-container').style.display = 'block';
+  document.getElementById('app-container').style.display = 'none';
+  document.getElementById('who-box').style.display = 'none';
+}
+
+function showAppUI() {
+  document.getElementById('auth-container').style.display = 'none';
+  document.getElementById('app-container').style.display = 'block';
+  document.getElementById('who-box').style.display = 'block';
+}
+
+function renderAuthScreen() {
+  const el = document.getElementById('auth-container');
+  const noticeHtml = authNotice ? `<div class="notice-text">${escapeHtml(authNotice)}</div>` : '';
+  const errorHtml = `<div class="error-text">${escapeHtml(authError)}</div>`;
+  let inner = '';
+
+  if (authScreen === 'login') {
+    inner = `
+      <h2>Log in</h2>
+      <div class="sub">Enter your username and password.</div>
+      ${noticeHtml}
+      <div class="field"><label>Username</label><input type="text" id="login-username" autocomplete="username" placeholder="e.g. sita_gautam"></div>
+      <div class="field"><label>Password</label><input type="password" id="login-password" autocomplete="current-password" placeholder="••••••••"></div>
+      ${errorHtml}
+      <button class="btn wide" onclick="handleLogin()">Login</button>
+      <div class="auth-links">
+        <button class="link-btn" onclick="goToScreen('register')">Register</button>
+        <button class="link-btn" onclick="goToScreen('forgotEmail')">Forgot password?</button>
+      </div>`;
+  } else if (authScreen === 'register') {
+    inner = `
+      <h2>Create your account</h2>
+      <div class="sub">Everyone in the family gets their own login.</div>
+      ${noticeHtml}
+      <div class="field"><label>Full Name</label><input type="text" id="reg-fullname" placeholder="e.g. Sita Gautam"></div>
+      <div class="field"><label>Phone Number</label><input type="tel" id="reg-phone" placeholder="e.g. 98XXXXXXXX"></div>
+      <div class="field"><label>Email Id</label><input type="email" id="reg-email" autocomplete="email" placeholder="you@example.com"></div>
+      <div class="field"><label>Username</label><input type="text" id="reg-username" autocomplete="username" placeholder="Pick any username"></div>
+      <div class="field"><label>Password</label><input type="password" id="reg-password" autocomplete="new-password" placeholder="At least 6 characters">
+        <div class="hint">At least 6 characters.</div></div>
+      <div class="field"><label>Confirm Password</label><input type="password" id="reg-confirm-password" autocomplete="new-password" placeholder="Re-enter password"></div>
+      ${errorHtml}
+      <button class="btn wide" onclick="handleRegister()">Register</button>
+      <div class="auth-links"><button class="link-btn" onclick="goToScreen('login')">Already have an account? Log in</button></div>`;
+  } else if (authScreen === 'awaitingVerification') {
+    inner = `
+      <h2>Check your email</h2>
+      <div class="sub">We sent a verification link to <strong>${escapeHtml(authNoticeEmail())}</strong>. Click it, then come back and log in.</div>
+      ${errorHtml}
+      <button class="btn wide secondary" onclick="handleResendVerification()">Resend verification email</button>
+      <div class="auth-links"><button class="link-btn" onclick="goToScreen('login')">Back to login</button></div>`;
+  } else if (authScreen === 'forgotEmail') {
+    inner = `
+      <h2>Forgot password</h2>
+      <div class="sub">Enter the email you registered with — we'll send a reset link.</div>
+      ${noticeHtml}
+      <div class="field"><label>Registered Email Id</label><input type="email" id="forgot-email" autocomplete="email" placeholder="you@example.com"></div>
+      ${errorHtml}
+      <button class="btn wide" onclick="handleForgotSubmit()">Send reset link</button>
+      <div class="auth-links"><button class="link-btn" onclick="goToScreen('login')">Back to login</button></div>`;
+  } else if (authScreen === 'forgotSent') {
+    inner = `
+      <h2>Check your email</h2>
+      <div class="sub">If that email is registered, a password reset link is on its way. Click it to set a new password.</div>
+      <div class="auth-links"><button class="link-btn" onclick="goToScreen('login')">Back to login</button></div>`;
+  } else if (authScreen === 'resetPassword') {
+    inner = `
+      <h2>Set a new password</h2>
+      <div class="sub">For ${escapeHtml(resetEmail)}</div>
+      <div class="field"><label>New Password</label><input type="password" id="reset-new-password" autocomplete="new-password" placeholder="At least 6 characters"></div>
+      <div class="field"><label>Confirm New Password</label><input type="password" id="reset-confirm-password" autocomplete="new-password" placeholder="Re-enter new password"></div>
+      ${errorHtml}
+      <button class="btn wide" onclick="handleResetPasswordSubmit()">Done</button>`;
+  }
+
+  el.innerHTML = `<div class="auth-wrap"><div class="auth-card">${inner}</div></div>`;
+}
+
+let lastRegisteredEmail = '';
+function authNoticeEmail() { return lastRegisteredEmail || (auth && auth.currentUser ? auth.currentUser.email : ''); }
+
+function goToScreen(screen) {
+  authScreen = screen;
+  authError = '';
+  authNotice = '';
+  renderAuthScreen();
+}
+
+// ---------- Auth actions ----------
+async function handleLogin() {
+  authError = '';
+  const username = (document.getElementById('login-username').value || '').trim().toLowerCase();
+  const password = document.getElementById('login-password').value || '';
+  if (!username || !password) { authError = 'Enter your username and password.'; renderAuthScreen(); return; }
+  try {
+    const nameDoc = await db.collection('hisab-usernames').doc(username).get();
+    if (!nameDoc.exists) { authError = 'Incorrect username or password.'; renderAuthScreen(); return; }
+    const email = nameDoc.data().email;
+    await auth.signInWithEmailAndPassword(email, password);
+    // onAuthStateChanged takes it from here
+  } catch (e) {
+    console.error(e);
+    authError = friendlyAuthError(e.code);
+    renderAuthScreen();
+  }
+}
+
+async function handleRegister() {
+  authError = '';
+  const fullName = (document.getElementById('reg-fullname').value || '').trim();
+  const phone = (document.getElementById('reg-phone').value || '').trim();
+  const email = (document.getElementById('reg-email').value || '').trim();
+  const usernameRaw = (document.getElementById('reg-username').value || '').trim();
+  const username = usernameRaw.toLowerCase();
+  const password = document.getElementById('reg-password').value || '';
+  const confirmPassword = document.getElementById('reg-confirm-password').value || '';
+
+  if (!fullName || !phone || !email || !usernameRaw || !password || !confirmPassword) {
+    authError = 'Please fill in every field.'; renderAuthScreen(); return;
+  }
+  if (!/^[a-z0-9_.]{3,20}$/.test(username)) {
+    authError = 'Username should be 3-20 characters: letters, numbers, dot or underscore.'; renderAuthScreen(); return;
+  }
+  if (password.length < 6) { authError = 'Password should be at least 6 characters.'; renderAuthScreen(); return; }
+  if (password !== confirmPassword) { authError = 'Password and Confirm Password don\'t match.'; renderAuthScreen(); return; }
+
+  try {
+    const nameDoc = await db.collection('hisab-usernames').doc(username).get();
+    if (nameDoc.exists) { authError = 'That username is already taken.'; renderAuthScreen(); return; }
+
+    const cred = await auth.createUserWithEmailAndPassword(email, password);
+    const user = cred.user;
+    await user.updateProfile({ displayName: fullName });
+    await db.collection('hisab-users').doc(user.uid).set({
+      fullName, phone, email, username, createdAt: new Date().toISOString()
+    });
+    await db.collection('hisab-usernames').doc(username).set({ uid: user.uid, email });
+    await user.sendEmailVerification({ url: returnUrl() });
+    lastRegisteredEmail = email;
+    goToScreen('awaitingVerification');
+  } catch (e) {
+    console.error(e);
+    authError = friendlyAuthError(e.code);
+    renderAuthScreen();
+  }
+}
+
+async function handleResendVerification() {
+  authError = '';
+  try {
+    if (auth.currentUser) {
+      await auth.currentUser.sendEmailVerification({ url: returnUrl() });
+      authNotice = 'Verification email sent again.';
+    } else {
+      authError = 'Please log in again to resend the verification email.';
+      goToScreen('login'); return;
+    }
+    renderAuthScreen();
+  } catch (e) {
+    console.error(e);
+    authError = friendlyAuthError(e.code);
+    renderAuthScreen();
+  }
+}
+
+async function handleForgotSubmit() {
+  authError = '';
+  const email = (document.getElementById('forgot-email').value || '').trim();
+  if (!email) { authError = 'Enter your registered email.'; renderAuthScreen(); return; }
+  try {
+    await auth.sendPasswordResetEmail(email, { url: returnUrl() });
+  } catch (e) {
+    console.error(e);
+    // Don't reveal whether the email exists; only show a real error for bad input.
+    if (e.code !== 'auth/user-not-found') {
+      authError = friendlyAuthError(e.code); renderAuthScreen(); return;
+    }
+  }
+  goToScreen('forgotSent');
+}
+
+async function handleResetPasswordSubmit() {
+  authError = '';
+  const newPassword = document.getElementById('reset-new-password').value || '';
+  const confirmNewPassword = document.getElementById('reset-confirm-password').value || '';
+  if (newPassword.length < 6) { authError = 'Password should be at least 6 characters.'; renderAuthScreen(); return; }
+  if (newPassword !== confirmNewPassword) { authError = 'New Password and Confirm New Password don\'t match.'; renderAuthScreen(); return; }
+  try {
+    await auth.confirmPasswordReset(resetOobCode, newPassword);
+    authNotice = 'Password updated! Please log in.';
+    goToScreen('login');
+  } catch (e) {
+    console.error(e);
+    authError = friendlyAuthError(e.code);
+    renderAuthScreen();
+  }
+}
+
+async function logout() {
+  if (ledgerUnsub) { ledgerUnsub(); ledgerUnsub = null; }
+  ledgerStarted = false;
+  data = { parties: [], transactions: [], entries: [] };
+  loaded = false;
+  await auth.signOut();
+}
+
+// ---------- Handle email-action links (verify email / reset password) ----------
+async function handleActionLink() {
+  const params = new URLSearchParams(window.location.search);
+  const mode = params.get('mode');
+  const oobCode = params.get('oobCode');
+  if (!mode || !oobCode) return false;
+
+  history.replaceState({}, '', window.location.pathname); // strip the query params
+
+  if (mode === 'verifyEmail') {
+    try {
+      await auth.applyActionCode(oobCode);
+      authNotice = 'Email verified! You can now log in.';
+    } catch (e) {
+      authError = friendlyAuthError(e.code);
+    }
+    authScreen = 'login';
+    return true;
+  }
+  if (mode === 'resetPassword') {
+    try {
+      const email = await auth.verifyPasswordResetCode(oobCode);
+      resetEmail = email;
+      resetOobCode = oobCode;
+      authScreen = 'resetPassword';
+    } catch (e) {
+      authError = friendlyAuthError(e.code);
+      authScreen = 'login';
+    }
+    return true;
+  }
+  return false;
 }
 
 // ---------- Local cache (makes refreshes instant) ----------
@@ -228,7 +510,6 @@ function loadFromCache() {
     if (cached && Array.isArray(cached.parties)) {
       data = cached;
       loaded = true;
-      usingCache = true;
       render();
       const el = document.getElementById('sync-status');
       el.textContent = 'showing saved copy — syncing…';
@@ -246,38 +527,66 @@ function saveToCache() {
 
 // ---------- Firebase / sync ----------
 function initFirebase() {
-  try {
-    firebase.initializeApp(firebaseConfig);
-    db = firebase.firestore();
-    // Lets the app read from a local on-device store first on future loads,
-    // and keeps working (read-only) if the connection is briefly unavailable.
-    db.enablePersistence().catch((err) => {
-      console.warn('Offline persistence not enabled:', err.code);
-    });
-    docRef = db.collection(DOC_PATH.collection).doc(DOC_PATH.doc);
-    docRef.onSnapshot(
-      (snap) => {
-        if (snap.exists) {
-          const d = snap.data();
-          data = { parties: d.parties || [], transactions: d.transactions || [], entries: d.entries || [] };
-        } else {
-          data = { parties: [], transactions: [], entries: [] };
-        }
-        loaded = true;
-        usingCache = false;
-        saveToCache();
-        setStatus(true);
-        render();
-      },
-      (err) => {
-        console.error('Sync error:', err);
-        setStatus(false, err.message);
+  firebase.initializeApp(firebaseConfig);
+  db = firebase.firestore();
+  auth = firebase.auth();
+  db.enablePersistence().catch((err) => {
+    console.warn('Offline persistence not enabled:', err.code);
+  });
+  docRef = db.collection(DOC_PATH.collection).doc(DOC_PATH.doc);
+
+  auth.onAuthStateChanged(async (user) => {
+    if (!user) {
+      showAuthUI();
+      if (authScreen !== 'resetPassword' && authScreen !== 'forgotEmail' && authScreen !== 'forgotSent') {
+        authScreen = 'login';
       }
-    );
-  } catch (e) {
-    console.error('Firebase init failed:', e);
-    setStatus(false, 'Could not connect');
-  }
+      renderAuthScreen();
+      return;
+    }
+    await user.reload();
+    if (!user.emailVerified) {
+      lastRegisteredEmail = user.email;
+      showAuthUI();
+      authScreen = 'awaitingVerification';
+      renderAuthScreen();
+      return;
+    }
+    try {
+      const snap = await db.collection('hisab-users').doc(user.uid).get();
+      userProfile = snap.exists ? snap.data() : { fullName: user.displayName || user.email };
+    } catch (e) {
+      userProfile = { fullName: user.displayName || user.email };
+    }
+    currentUser = userProfile.fullName;
+    document.getElementById('current-user-label').textContent = currentUser;
+    showAppUI();
+    startLedgerSync();
+  });
+}
+
+function startLedgerSync() {
+  if (ledgerStarted) return;
+  ledgerStarted = true;
+  loadFromCache();
+  ledgerUnsub = docRef.onSnapshot(
+    (snap) => {
+      if (snap.exists) {
+        const d = snap.data();
+        data = { parties: d.parties || [], transactions: d.transactions || [], entries: d.entries || [] };
+      } else {
+        data = { parties: [], transactions: [], entries: [] };
+      }
+      loaded = true;
+      saveToCache();
+      setStatus(true);
+      render();
+    },
+    (err) => {
+      console.error('Sync error:', err);
+      setStatus(false, err.message);
+    }
+  );
 }
 
 function setStatus(ok, msg) {
@@ -297,38 +606,6 @@ async function saveData() {
     setStatus(false, 'could not save that change');
     alert("That didn't save — check your internet connection and try again.");
   }
-}
-
-// ---------- Who is using this device ----------
-function ensureUser(callback) {
-  if (currentUser) { callback(); return; }
-  promptForUser(callback);
-}
-
-function promptForUser(callback) {
-  const overlay = document.createElement('div');
-  overlay.className = 'overlay';
-  overlay.id = 'user-overlay';
-  overlay.innerHTML = `<div class="modal">
-    <h3>Who's using this?</h3>
-    <div class="field"><label>Your name</label><input type="text" id="user-name-input" placeholder="e.g. Mom, Sita, You"></div>
-    <div id="user-error" class="error-text"></div>
-    <div class="modal-actions"><button class="btn" id="user-continue-btn">Continue</button></div>
-  </div>`;
-  document.body.appendChild(overlay);
-  document.getElementById('user-continue-btn').onclick = () => {
-    const name = document.getElementById('user-name-input').value.trim();
-    if (!name) { document.getElementById('user-error').textContent = 'Enter a name.'; return; }
-    currentUser = name;
-    localStorage.setItem(USER_KEY, name);
-    document.getElementById('current-user-label').textContent = name;
-    overlay.remove();
-    if (callback) callback();
-  };
-}
-
-function switchUser() {
-  promptForUser(() => render());
 }
 
 // ---------- Calculations ----------
@@ -362,8 +639,6 @@ function totals() {
 // ---------- Rendering ----------
 function render() {
   const el = document.getElementById('content');
-  document.getElementById('current-user-label').textContent = currentUser || '—';
-
   if (!loaded) { el.innerHTML = '<div class="loading-screen">Opening your ledger…</div>'; return; }
 
   const t = totals();
@@ -377,8 +652,8 @@ function render() {
   </div>`;
 
   html += `<div class="top-actions">
-    <button class="btn" onclick="ensureUser(() => openModal('party'))">+ Add party</button>
-    <button class="btn secondary" onclick="ensureUser(() => openModal('entry'))">+ Add income / expense</button>
+    <button class="btn" onclick="openModal('party')">+ Add party</button>
+    <button class="btn secondary" onclick="openModal('entry')">+ Add income / expense</button>
   </div>`;
 
   html += `<section class="block"><div class="section-head"><h2>Parties</h2></div>`;
@@ -496,7 +771,7 @@ function renderPartyPanel() {
     <div class="field"><label>Date</label><input type="date" id="txn-date" value="${todayStr()}"></div>
     <div class="field"><label>Note (optional)</label><input type="text" id="txn-note" placeholder="What was this for?"></div>
     <div id="txn-error" class="error-text"></div>
-    <div class="modal-actions"><button class="btn" onclick="ensureUser(() => submitTxn('${party.id}'))">Save entry</button></div>
+    <div class="modal-actions"><button class="btn" onclick="submitTxn('${party.id}')">Save entry</button></div>
   </div>`;
 
   const existing = document.getElementById('party-overlay');
@@ -592,17 +867,15 @@ async function deleteEntry(id) {
 }
 
 // ---------- Init ----------
-document.getElementById('current-user-label').textContent = currentUser || '—';
 if (configIsPlaceholder()) {
   showSetupScreen();
 } else {
-  // Paint the last-known ledger from local storage immediately, before
-  // Firebase's scripts (loaded with `defer`) have even finished downloading.
-  loadFromCache();
-  ensureUser(() => {});
-  // Firebase's compat scripts are `defer`red, so wait for the page to finish
-  // parsing before touching the `firebase` global.
-  window.addEventListener('DOMContentLoaded', initFirebase);
+  window.addEventListener('DOMContentLoaded', async () => {
+    initFirebase();
+    const handledLink = await handleActionLink();
+    showAuthUI();
+    renderAuthScreen();
+  });
 }
 </script>
 </body>
